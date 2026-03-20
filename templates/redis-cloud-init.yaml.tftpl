@@ -1,0 +1,156 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+packages:
+%{ if engine == "valkey" ~}
+  - valkey-server
+  - valkey-tools
+%{ else ~}
+  - redis-server
+  - redis-tools
+%{ endif ~}
+  - iptables
+  - iptables-persistent
+
+write_files:
+  - path: /etc/redis/redis.conf.d/custom.conf
+    owner: redis:redis
+    permissions: "0640"
+    content: |
+      # ── Network ────────────────────────────────────────────────────────────
+      bind 0.0.0.0
+      port ${port}
+      protected-mode no
+      tcp-backlog 511
+      tcp-keepalive 300
+      timeout 0
+
+      # ── Memory ─────────────────────────────────────────────────────────────
+      maxmemory ${maxmemory_mb}mb
+      maxmemory-policy ${maxmemory_policy}
+
+%{ if requirepass != "" ~}
+      # ── Authentication ─────────────────────────────────────────────────────
+      requirepass ${requirepass}
+%{ endif ~}
+
+%{ if persistence_enabled ~}
+      # ── Persistence (RDB) ──────────────────────────────────────────────────
+      save 900 1
+      save 300 10
+      save 60 10000
+      stop-writes-on-bgsave-error yes
+      rdbcompression yes
+      rdbchecksum yes
+      dbfilename dump.rdb
+      dir /var/lib/redis
+
+      # ── Persistence (AOF) ──────────────────────────────────────────────────
+      appendonly yes
+      appendfilename "appendonly.aof"
+      appendfsync everysec
+      no-appendfsync-on-rewrite no
+      auto-aof-rewrite-percentage 100
+      auto-aof-rewrite-min-size 64mb
+      aof-use-rdb-preamble yes
+%{ else ~}
+      # ── Persistence (disabled) ─────────────────────────────────────────────
+      save ""
+      appendonly no
+%{ endif ~}
+
+      # ── Logging ────────────────────────────────────────────────────────────
+      loglevel notice
+      logfile /var/log/redis/redis-server.log
+
+      # ── Performance tuning ─────────────────────────────────────────────────
+      hz 10
+      dynamic-hz yes
+      lazyfree-lazy-eviction yes
+      lazyfree-lazy-expire yes
+      lazyfree-lazy-server-del yes
+      lazyfree-lazy-user-del yes
+
+  - path: /opt/elasticache/setup-redis.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      ENGINE="${engine}"
+      PORT="${port}"
+
+      # ── Determine service name and config paths ────────────────────────────
+      if [ "$ENGINE" = "valkey" ]; then
+        SERVICE="valkey-server"
+        MAIN_CONF="/etc/valkey/valkey.conf"
+        CONF_DIR="/etc/valkey/valkey.conf.d"
+        # Move custom config to valkey path if needed
+        if [ -f /etc/redis/redis.conf.d/custom.conf ]; then
+          mkdir -p /etc/valkey/valkey.conf.d
+          mv /etc/redis/redis.conf.d/custom.conf "$CONF_DIR/custom.conf"
+          chown valkey:valkey "$CONF_DIR/custom.conf"
+        fi
+      else
+        SERVICE="redis-server"
+        MAIN_CONF="/etc/redis/redis.conf"
+        CONF_DIR="/etc/redis/redis.conf.d"
+      fi
+
+      # ── Create conf.d directory if it does not exist ───────────────────────
+      mkdir -p "$CONF_DIR"
+
+      # ── Add include directive to main config if not present ────────────────
+      INCLUDE_LINE="include $CONF_DIR/custom.conf"
+      if ! grep -qF "$INCLUDE_LINE" "$MAIN_CONF" 2>/dev/null; then
+        echo "" >> "$MAIN_CONF"
+        echo "# Include custom ElastiCache configuration" >> "$MAIN_CONF"
+        echo "$INCLUDE_LINE" >> "$MAIN_CONF"
+      fi
+
+      # ── Configure kernel parameters for Redis ─────────────────────────────
+      sysctl -w vm.overcommit_memory=1 || true
+      sysctl -w net.core.somaxconn=65535 || true
+      echo "vm.overcommit_memory = 1" >> /etc/sysctl.conf
+      echo "net.core.somaxconn = 65535" >> /etc/sysctl.conf
+
+      # Disable THP (Transparent Huge Pages)
+      echo never > /sys/kernel/mm/transparent_hugepage/enabled || true
+
+      # ── Configure iptables firewall rules ──────────────────────────────────
+      # Flush existing rules for the cache port
+      iptables -D INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null || true
+      iptables -D INPUT -p tcp --dport "$PORT" -j REJECT 2>/dev/null || true
+
+      # Remove any previous allow rules for this port
+      while iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do :; done
+
+%{ for cidr in allowed_cidrs ~}
+      iptables -A INPUT -p tcp -s ${cidr} --dport "$PORT" -j ACCEPT
+%{ endfor ~}
+
+      # Drop all other traffic to the cache port
+      iptables -A INPUT -p tcp --dport "$PORT" -j DROP
+
+      # Persist iptables rules
+      mkdir -p /etc/iptables
+      iptables-save > /etc/iptables/rules.v4
+
+      # ── Ensure data directory permissions ──────────────────────────────────
+      if [ "$ENGINE" = "valkey" ]; then
+        mkdir -p /var/lib/valkey
+        chown valkey:valkey /var/lib/valkey
+      else
+        mkdir -p /var/lib/redis
+        chown redis:redis /var/lib/redis
+      fi
+
+      # ── Restart the cache service ─────────────────────────────────────────
+      systemctl enable "$SERVICE"
+      systemctl restart "$SERVICE"
+
+      echo "[elasticache] $ENGINE setup completed successfully."
+
+runcmd:
+  - bash /opt/elasticache/setup-redis.sh
